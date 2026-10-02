@@ -1,0 +1,137 @@
+@import 'tailwindcss';
+@import 'leaflet/dist/leaflet.css';
+
+/*
+ * ResQ design tokens.
+ *
+ * The organising idea is legibility of confidence: every claim the product
+ * makes has to show how much it should be trusted. Colour alone never carries
+ * that (master prompt §32) — status always pairs a hue with a glyph, and the
+ * confidence rail on each result pairs it with a line pattern.
+ *
+ * --urgent is reserved for emergency affordances ONLY. Errors, destructive
+ * actions and validation use neutral ink. On a product where red means "this
+ * is the emergency path", it cannot also mean "you mistyped your password".
+ */
+@theme {
+  --color-ink: #11161c;
+  --color-ink-soft: #2b3440;
+  --color-muted: #5b6670;
+  --color-line: #d8dee3;
+  --color-paper: #f7f8f7;
+  --color-surface: #ffffff;
+
+  --color-signal: #0b5fff;
+  --color-signal-dark: #0a4ccc;
+  --color-signal-wash: #eaf1ff;
+
+  --color-urgent: #d01b2c;
+  --color-urgent-dark: #a81322;
+  --color-urgent-wash: #fdecee;
+
+  --color-verified: #0f7a5a;
+  --color-verified-wash: #e8f5f0;
+  --color-caution: #b45309;
+  --color-caution-wash: #fdf3e7;
+
+  --font-sans: 'Barlow', ui-sans-serif, system-ui, sans-serif;
+
+  --radius-card: 6px;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Distances, times and counts are compared down a column; proportional
+     figures make that harder to scan. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  :focus-visible {
+    outline: 3px solid var(--color-signal);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  /*
+   * The confidence rail. Carries freshness on the leading edge of every
+   * result, encoded as pattern AND colour so it survives greyscale and
+   * colour-blindness.
+   *   solid    = recently updated
+   *   dashed   = stale
+   *   hollow   = no information at all
+   */
+  .rail {
+    width: 4px;
+    flex: none;
+    border-radius: 2px;
+    align-self: stretch;
+  }
+  .rail-recent {
+    background: var(--color-verified);
+  }
+  .rail-demo {
+    background: repeating-linear-gradient(
+      180deg,
+      var(--color-signal) 0 6px,
+      transparent 6px 10px
+    );
+  }
+  .rail-stale {
+    background: repeating-linear-gradient(
+      180deg,
+      var(--color-caution) 0 5px,
+      transparent 5px 9px
+    );
+  }
+  .rail-unknown {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px var(--color-line);
+  }
+
+  .skeleton {
+    background: linear-gradient(90deg, #eceff1 25%, #f5f7f8 50%, #eceff1 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.4s linear infinite;
+  }
+
+  @keyframes shimmer {
+    to {
+      background-position: -200% 0;
+    }
+  }
+}
+
+/* Leaflet's default marker images are bundled assets we do not ship; markers
+   are drawn with divIcon instead. This keeps the attribution legible. */
+.leaflet-container {
+  font-family: var(--font-sans);
+  background: #e8ebed;
+}
+.leaflet-control-attribution {
+  font-size: 10px;
+}

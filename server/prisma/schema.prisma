@@ -1,0 +1,503 @@
+// ResQ — Prisma schema (prototype / P0 MVP)
+// PostgreSQL, no PostGIS. Distance = bounding-box prefilter + Haversine.
+//
+// Decisions baked in here (do NOT re-derive from TDD §9's conceptual field list):
+//   1. Hospital            -> Facility   (the table also holds clinics, blood banks,
+//                                         pharmacies and ambulance providers)
+//   2. BloodBank.facilityId is nullable  (standalone blood banks exist)
+//   3. Ambulance carries latitude/longitude, not just a text `area`
+//   4. RefreshToken is persisted, so TDD §13.3 rotation/revocation is enforceable
+//   5. CostEstimate + DocumentRequirement are cut from scope
+//   6. freshnessStatus is DERIVED at read time from lastUpdatedAt — never stored.
+//      Storing it guarantees it goes stale, which is the exact failure mode
+//      TDD §12 exists to prevent.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+// Where a piece of information came from. Drives the trust badge in the UI.
+
+
+// Which resource an availability row describes.
+
+
+
+
+// Declared here so client and server share one generated type, but deliberately
+// NOT a column on any model — the API computes it per request from lastUpdatedAt.
+// See lib/freshness.ts.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---------------------------------------------------------------------------
+// Identity & sessions
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String     @id @default(uuid())
+  name         String
+  email        String     @unique
+  phone        String?
+  passwordHash String
+  role         String   @default("USER")
+  status       String @default("ACTIVE")
+  profileImage String?
+
+  // The last location the user picked MANUALLY. Never a GPS fix — precise
+  // coordinates live only on EmergencySession, which expires. See PRD privacy.
+  preferredCity String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refreshTokens     RefreshToken[]
+  emergencyContacts EmergencyContact[]
+  savedFacilities   SavedFacility[]
+  emergencySessions EmergencySession[]
+  managedFacilities FacilityAdmin[]
+  reportsFiled      Report[]               @relation("ReportReporter")
+  reportsResolved   Report[]               @relation("ReportResolver")
+  verificationsDone Verification[]         @relation("VerificationReviewer")
+  availabilityEdits FacilityAvailability[] @relation("AvailabilityUpdatedBy")
+  auditLogs         AuditLog[]
+
+  @@index([role])
+  @@index([phone])
+}
+
+// Persisted so refresh tokens can actually be rotated and revoked.
+// Store a hash of the token, never the token itself.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  // Set when this token is rotated. A replayed already-rotated token then
+  // proves a stolen chain, and the whole family can be revoked at once.
+  replacedByTokenId String?
+
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Join table rather than User.facilityId: one admin may manage more than one
+// facility, and ownership checks then have exactly one place to live.
+model FacilityAdmin {
+  id         String   @id @default(uuid())
+  userId     String
+  facilityId String
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  facility Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, facilityId])
+  @@index([facilityId])
+}
+
+// ---------------------------------------------------------------------------
+// Facilities
+// ---------------------------------------------------------------------------
+
+model Facility {
+  id          String       @id @default(uuid())
+  name        String
+  type        String
+  description String?
+
+  address    String
+  city       String
+  state      String?
+  postalCode String?
+
+  // Decimal(9,6), not Float. Coordinates are compared inside a bounding-box
+  // predicate and indexed; binary-float drift there is a small but real
+  // correctness risk, and 6 dp is ~11 cm — far beyond what we need.
+  latitude  Float
+  longitude Float
+
+  phone          String?
+  emergencyPhone String?
+  website        String?
+  logoUrl        String?
+
+  hasEmergency Boolean @default(false)
+
+  verificationStatus String @default("UNVERIFIED")
+  sourceType         String         @default("UNKNOWN")
+  dataSourceId       String?
+
+  // Last time any part of this facility's profile changed. Feeds the
+  // "updated N minutes ago" label on the detail page.
+  lastUpdatedAt DateTime @default(now())
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft delete — users may have saved this facility
+
+  dataSource        DataSource?            @relation(fields: [dataSourceId], references: [id])
+  departments       FacilityDepartment[]
+  services          FacilityService[]
+  availability      FacilityAvailability[]
+  operatingHours    OperatingHour[]
+  bloodBank         BloodBank?
+  ambulances        Ambulance[]
+  verifications     Verification[]
+  reports           Report[]
+  savedBy           SavedFacility[]
+  admins            FacilityAdmin[]
+  emergencySessions EmergencySession[]
+
+  // A B-tree range-scans the leading column well and the second only
+  // partially, so this mainly accelerates the latitude half of the bbox.
+  // That is enough well past prototype scale; swap in a PostGIS GiST index
+  // if it ever stops being enough.
+  @@index([latitude, longitude])
+  @@index([city])
+  @@index([type])
+  @@index([verificationStatus])
+  @@index([hasEmergency])
+  @@index([deletedAt])
+}
+
+model Department {
+  id          String  @id @default(uuid())
+  name        String  @unique
+  slug        String  @unique
+  description String?
+
+  facilities FacilityDepartment[]
+}
+
+model Service {
+  id          String  @id @default(uuid())
+  name        String  @unique
+  slug        String  @unique
+  description String?
+
+  facilities FacilityService[]
+}
+
+model FacilityDepartment {
+  id           String   @id @default(uuid())
+  facilityId   String
+  departmentId String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  facility   Facility   @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@unique([facilityId, departmentId])
+  @@index([departmentId])
+}
+
+model FacilityService {
+  id         String   @id @default(uuid())
+  facilityId String
+  serviceId  String
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  facility Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+  service  Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([facilityId, serviceId])
+  @@index([serviceId])
+}
+
+// Exactly one CURRENT row per (facility, resourceType). History lives in
+// AuditLog, so the hot read path never windows over superseded rows.
+model FacilityAvailability {
+  id           String             @id @default(uuid())
+  facilityId   String
+  resourceType String
+  status       String @default("UNKNOWN")
+
+  // Optional, and only surfaced as a hard number when sourceType is
+  // OFFICIAL or VERIFIED_PROVIDER. Otherwise the UI shows the status word only.
+  count Int?
+  note  String?
+
+  sourceType    String @default("UNKNOWN")
+  dataSourceId  String?
+  updatedById   String?
+  lastUpdatedAt DateTime   @default(now())
+  createdAt     DateTime   @default(now())
+
+  facility   Facility    @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+  dataSource DataSource? @relation(fields: [dataSourceId], references: [id])
+  updatedBy  User?       @relation("AvailabilityUpdatedBy", fields: [updatedById], references: [id])
+
+  @@unique([facilityId, resourceType])
+  @@index([status])
+  @@index([lastUpdatedAt])
+}
+
+model OperatingHour {
+  id         String @id @default(uuid())
+  facilityId String
+
+  // 0 = Sunday .. 6 = Saturday
+  dayOfWeek Int
+
+  // "HH:MM", 24-hour, zero-padded. Prisma has no portable time-only type;
+  // zero-padded 24h strings compare correctly with plain string comparison,
+  // and Zod enforces the format at the edge.
+  openTime  String?
+  closeTime String?
+
+  isClosed  Boolean @default(false)
+  is24Hours Boolean @default(false)
+
+  facility Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@unique([facilityId, dayOfWeek])
+}
+
+// ---------------------------------------------------------------------------
+// Blood & ambulance
+// Second-pass features, but the schema ships now so migrations don't churn.
+// ---------------------------------------------------------------------------
+
+model BloodBank {
+  id String @id @default(uuid())
+
+  // Nullable: a standalone blood bank belongs to no facility.
+  facilityId String? @unique
+
+  name      String
+  phone     String?
+  address   String
+  city      String
+  latitude  Float
+  longitude Float
+
+  verificationStatus String @default("UNVERIFIED")
+  sourceType         String         @default("UNKNOWN")
+  lastUpdatedAt      DateTime           @default(now())
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  facility  Facility?        @relation(fields: [facilityId], references: [id])
+  inventory BloodInventory[]
+
+  @@index([latitude, longitude])
+  @@index([city])
+}
+
+model BloodInventory {
+  id          String             @id @default(uuid())
+  bloodBankId String
+  bloodGroup  String
+  component   String
+  status      String @default("UNKNOWN")
+
+  sourceType    String @default("UNKNOWN")
+  lastUpdatedAt DateTime   @default(now())
+
+  bloodBank BloodBank @relation(fields: [bloodBankId], references: [id], onDelete: Cascade)
+
+  @@unique([bloodBankId, bloodGroup, component])
+  @@index([bloodGroup, component, status])
+}
+
+// Directory only. No dispatch, no ETA, no live tracking. See TDD §16 / master §27.
+model Ambulance {
+  id           String        @id @default(uuid())
+  providerName String
+  phone        String
+  type         String @default("OTHER")
+
+  // Base / dispatch point, so /ambulances/nearby is a real geospatial query
+  // rather than a string match on a free-text area.
+  latitude  Float
+  longitude Float
+
+  coverageArea String?
+  facilityId   String?
+
+  status             String @default("UNKNOWN")
+  verificationStatus String @default("UNVERIFIED")
+  sourceType         String         @default("UNKNOWN")
+  lastUpdatedAt      DateTime           @default(now())
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  facility Facility? @relation(fields: [facilityId], references: [id])
+
+  @@index([latitude, longitude])
+  @@index([type])
+}
+
+// ---------------------------------------------------------------------------
+// User-owned records
+// ---------------------------------------------------------------------------
+
+model EmergencyContact {
+  id           String  @id @default(uuid())
+  userId       String
+  name         String
+  phone        String
+  relationship String?
+  priority     Int     @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, priority])
+}
+
+model SavedFacility {
+  id         String   @id @default(uuid())
+  userId     String
+  facilityId String
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  facility Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, facilityId])
+  @@index([userId])
+}
+
+// Precise coordinates live HERE and nowhere else, and only for the life of the
+// session. expiresAt drives a purge job. userId is nullable so Emergency Mode
+// works signed-out, and SetNull keeps an in-flight session alive if the account
+// is deleted mid-emergency.
+model EmergencySession {
+  id     String  @id @default(uuid())
+  userId String?
+
+  latitude  Float
+  longitude Float
+
+  status             String @default("ACTIVE")
+  selectedFacilityId String?
+
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+  expiresAt DateTime
+
+  user             User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  selectedFacility Facility? @relation(fields: [selectedFacilityId], references: [id])
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Trust, governance, audit
+// ---------------------------------------------------------------------------
+
+model DataSource {
+  id          String     @id @default(uuid())
+  name        String     @unique
+  type        String
+  reliability Int        @default(0) // 0-100, used for source precedence
+  url         String?
+  lastSyncAt  DateTime?
+  createdAt   DateTime   @default(now())
+
+  facilities   Facility[]
+  availability FacilityAvailability[]
+}
+
+model Verification {
+  id         String             @id @default(uuid())
+  facilityId String
+  status     String @default("PENDING_REVIEW")
+  sourceType String         @default("UNKNOWN")
+
+  evidence     String?
+  notes        String?
+  reviewedById String?
+  reviewedAt   DateTime?
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  facility   Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+  reviewedBy User?    @relation("VerificationReviewer", fields: [reviewedById], references: [id])
+
+  @@index([facilityId])
+  @@index([status, createdAt])
+}
+
+model Report {
+  id         String  @id @default(uuid())
+  facilityId String
+  reporterId String? // nullable: anonymous reports are allowed
+
+  category    String
+  description String
+  status      String   @default("OPEN")
+
+  resolutionNote String?
+  resolvedById   String?
+  createdAt      DateTime  @default(now())
+  resolvedAt     DateTime?
+
+  facility   Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+  reporter   User?    @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: SetNull)
+  resolvedBy User?    @relation("ReportResolver", fields: [resolvedById], references: [id])
+
+  @@index([status, createdAt])
+  @@index([facilityId])
+}
+
+// Append-only. Nothing in the application may ever UPDATE or DELETE a row here.
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  action     String // e.g. FACILITY_VERIFIED, AVAILABILITY_UPDATED
+  entityType String
+  entityId   String
+  metadata   Json?
+  requestId  String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
